@@ -260,59 +260,77 @@ fileprivate func guid() -> Data
     return Data(bytes: &uuidBytes, count: MemoryLayout.size(ofValue: uuidBytes))
 #elseif targetEnvironment(macCatalyst) || os(macOS)
     
-    var masterPort = mach_port_t()
-    var kernResult: kern_return_t = IOMasterPort(mach_port_t(MACH_PORT_NULL), &masterPort)
-    if (kernResult != KERN_SUCCESS)
+    if let guid = getMacAddress()
     {
-        assertionFailure("Failed to initialize master port")
-    }
-    
-    let matchingDict = IOBSDNameMatching(masterPort, 0, "en0")
-    if (matchingDict == nil)
-    {
+        return guid
+    }else{
         assertionFailure("Failed to retrieve guid")
     }
     
+    return Data() // Never get called
+#endif
+}
+
+#if targetEnvironment(macCatalyst) || os(macOS)
+func getMacAddress() -> Data?
+{
+    guard let service = ioService(named: "en0", wantBuiltIn: true)
+            ?? ioService(named: "en1", wantBuiltIn: true)
+            ?? ioService(named: "en0", wantBuiltIn: false)
+    else { return nil }
+    
+    defer { IOObjectRelease(service) }
+    
+    if let cftype = IORegistryEntrySearchCFProperty(service, kIOServicePlane, "IOMACAddress" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents))
+    {
+        return (cftype as? Data)
+    }
+    
+    return nil
+}
+
+func ioService(named name: String, wantBuiltIn: Bool) -> io_service_t?
+{
+    let main_port: mach_port_t
+    if #available(macOS 12.0, macCatalyst 15.0, *) {
+        main_port = kIOMainPortDefault
+    } else {
+        main_port = 0 // the kIOMasterPortDefault symbol is unavailable on xcode 14 and later.
+    }
     var iterator = io_iterator_t()
-    kernResult = IOServiceGetMatchingServices(masterPort, matchingDict, &iterator)
-    if (kernResult != KERN_SUCCESS)
-    {
-        assertionFailure("Failed to retrieve guid")
-    }
-    
-    var guidData: Data?
-    var service = IOIteratorNext(iterator)
-    var parentService = io_object_t()
     
     defer
     {
-        IOObjectRelease(iterator)
-    }
-    
-    while(service != 0)
-    {
-        kernResult = IORegistryEntryGetParentEntry(service, kIOServicePlane, &parentService)
-        
-        if (kernResult == KERN_SUCCESS)
+        if iterator != IO_OBJECT_NULL
         {
-            guidData = IORegistryEntryCreateCFProperty(parentService, "IOMACAddress" as CFString, nil, 0).takeRetainedValue() as? Data
-            
-            IOObjectRelease(parentService)
-        }
-        IOObjectRelease(service)
-        
-        if  guidData != nil {
-            break
-        }else{
-            service = IOIteratorNext(iterator)
+            IOObjectRelease(iterator)
         }
     }
     
-    if guidData == nil
+    guard let matchingDict = IOBSDNameMatching(main_port, 0, name),
+          IOServiceGetMatchingServices(main_port, matchingDict as CFDictionary, &iterator) == KERN_SUCCESS,
+          iterator != IO_OBJECT_NULL
+    else
     {
-        assertionFailure("Failed to retrieve guid")
+        return nil
     }
     
-    return guidData!    
-#endif
+    var candidate = IOIteratorNext(iterator)
+    while candidate != IO_OBJECT_NULL
+    {
+        if let cftype = IORegistryEntryCreateCFProperty(candidate, "IOBuiltin" as CFString, kCFAllocatorDefault, 0)
+        {
+            let isBuiltIn = cftype.takeRetainedValue() as! CFBoolean
+            if wantBuiltIn == CFBooleanGetValue(isBuiltIn)
+            {
+                return candidate
+            }
+        }
+        
+        IOObjectRelease(candidate)
+        candidate = IOIteratorNext(iterator)
+    }
+    
+    return nil
 }
+#endif
